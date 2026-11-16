@@ -1,4 +1,4 @@
-import React, { useEffect, useState } from 'react';
+import React, { useEffect, useRef, useState } from 'react';
 import { Play, RotateCcw, ShieldCheck, Wifi } from 'lucide-react';
 import { TERMINAL_SCENARIOS, TerminalLine } from '../data/runtimeData';
 
@@ -6,6 +6,7 @@ export const TermuxSimulator: React.FC = () => {
   const [activeIndex, setActiveIndex] = useState(0);
   const [visibleCount, setVisibleCount] = useState(0);
   const [runNonce, setRunNonce] = useState(0);
+  const viewportRef = useRef<HTMLDivElement | null>(null);
 
   const scenario = TERMINAL_SCENARIOS[activeIndex];
 
@@ -26,6 +27,13 @@ export const TermuxSimulator: React.FC = () => {
 
     return () => window.clearInterval(timer);
   }, [activeIndex, runNonce, scenario.lines.length]);
+
+  useEffect(() => {
+    const node = viewportRef.current;
+    if (node) {
+      node.scrollTop = node.scrollHeight;
+    }
+  }, [visibleCount]);
 
   const handleCycleTab = () => {
     setActiveIndex((prev) => (prev + 1) % TERMINAL_SCENARIOS.length);
@@ -147,7 +155,9 @@ export const TermuxSimulator: React.FC = () => {
       </div>
 
       {/* Terminal Viewport */}
-      <div className="p-4 sm:p-5 font-mono text-xs sm:text-[12.5px] min-h-[325px] max-h-[370px] overflow-auto term-scroll bg-[#090C0B] space-y-1">
+      <div
+        ref={viewportRef}
+        className="p-4 sm:p-5 font-mono text-xs sm:text-[12.5px] min-h-[325px] max-h-[370px] overflow-auto term-scroll bg-[#090C0B] space-y-1">
         {scenario.lines.slice(0, visibleCount).map((line, idx) => renderLine(line, idx))}
 
         {/* Active prompt / cursor */}
