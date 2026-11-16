@@ -1,0 +1,119 @@
+@import "tailwindcss";
+
+@layer base {
+  :root {
+    --bg-canvas: #090b0a;
+    --bg-surface-1: #0f1311;
+    --bg-surface-2: #141917;
+    --border-hairline: #1e2622;
+    --border-strong: #2c3832;
+    --ink-primary: #ecf2ee;
+    --ink-secondary: #94a39b;
+    --ink-muted: #5d6d65;
+    --accent-phosphor: #10e88a;
+    --accent-amber: #f59e0b;
+    --accent-crimson: #ef4444;
+  }
+
+  html {
+    background-color: #090b0a;
+    color: #ecf2ee;
+    font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+    scroll-padding-top: 5rem;
+  }
+
+  code,
+  pre,
+  kbd,
+  samp,
+  .font-mono {
+    font-family: 'JetBrains Mono', ui-monospace, 'SFMono-Regular', Menlo, Monaco, Consolas, monospace;
+    font-feature-settings: "liga" 0, "zero" 1;
+  }
+
+  .font-display {
+    font-family: 'Space Grotesk', 'Inter', -apple-system, BlinkMacSystemFont, sans-serif;
+    letter-spacing: -0.025em;
+  }
+}
+
+.tabular-nums {
+  font-variant-numeric: tabular-nums;
+}
+
+/* Subtle architectural grid background */
+.bg-terminal-grid {
+  background-size: 40px 40px;
+  background-image:
+    linear-gradient(to right, rgba(30, 38, 34, 0.38) 1px, transparent 1px),
+    linear-gradient(to bottom, rgba(30, 38, 34, 0.38) 1px, transparent 1px);
+}
+
+.bg-radial-mask {
+  mask-image: radial-gradient(ellipse 80% 65% at 50% 25%, #000 45%, transparent 100%);
+  -webkit-mask-image: radial-gradient(ellipse 80% 65% at 50% 25%, #000 45%, transparent 100%);
+}
+
+@keyframes cursor-blink {
+  0%, 49% {
+    opacity: 1;
+  }
+  50%, 100% {
+    opacity: 0;
+  }
+}
+
+.animate-cursor {
+  animation: cursor-blink 1.05s infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% {
+    opacity: 1;
+    transform: scale(1);
+  }
+  50% {
+    opacity: 0.45;
+    transform: scale(0.88);
+  }
+}
+
+.animate-pulse-dot {
+  animation: pulse-dot 2.2s ease-in-out infinite;
+}
+
+/* Clean custom scrollbars inside code/terminal blocks */
+.term-scroll::-webkit-scrollbar {
+  width: 6px;
+  height: 6px;
+}
+
+.term-scroll::-webkit-scrollbar-track {
+  background: #0b0e0d;
+}
+
+.term-scroll::-webkit-scrollbar-thumb {
+  background: #232d28;
+  border-radius: 3px;
+}
+
+.term-scroll::-webkit-scrollbar-thumb:hover {
+  background: #33423b;
+}
+
+/* Hide scrollbars for compact key bars */
+.no-scrollbar::-webkit-scrollbar {
+  display: none;
+}
+
+.no-scrollbar {
+  -ms-overflow-style: none;
+  scrollbar-width: none;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-cursor,
+  .animate-pulse-dot {
+    animation: none;
+  }
+}
