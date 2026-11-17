@@ -8,7 +8,7 @@ Built with **React 19**, **TypeScript**, **Vite 6**, and **Tailwind CSS v4**.
 
 ## Sections
 
-- **Hero** — title, tagline, one-line install command, and an interactive Android Termux simulator with four replayable scenarios (install & launch, 429 WARP rotation, audit refusal guard, `opencode doctor`).
+- **Hero** — title, tagline, one-line install command, and a working in-browser terminal. Type real commands (`opencode`, `opencode -1`/`-2`, `-m <model>`, `opencode doctor`, `opencode-proxy status|restart|test|logs`, `curl ... | bash`, `cat`, `help`, `clear`, arrow-key history) and use the simulated OpenCode TUI: prompt streaming, `/model`, `/models`, `/proxy status`, `/exit`, `esc` to leave. Model replies are simulated locally — no requests leave the browser.
 - **Core Features** — Pure Native, Auto-Rotation, Failover Pool, Daemonized.
 - **Gateway Architecture** — interactive four-stage pipeline (`opencode` → `127.0.0.1:8080` → WARP IPv6 → failover pool) with stress-event simulations and a live six-worker IPv6 pool readout.
 - **Model Catalog** — searchable / filterable table of Mode 1 free unlimited models and Mode 2 OpenRouter models, each with a copyable launch command.

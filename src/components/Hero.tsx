@@ -2,7 +2,7 @@ import React from 'react';
 import { ArrowRight, ArrowUpRight, Github, ShieldCheck, Smartphone, Zap } from 'lucide-react';
 import { GITHUB_REPO_URL, INSTALL_COMMAND } from '../data/runtimeData';
 import { CopyButton } from './CopyButton';
-import { TermuxSimulator } from './TermuxSimulator';
+import { OpenCodeTerminal } from './OpenCodeTerminal';
 
 const STATS = [
   { label: 'FREE MODELS', value: '10', suffix: 'online' },
@@ -121,7 +121,7 @@ export const Hero: React.FC = () => {
           {/* Right: Terminal */}
           <div className="lg:col-span-6 xl:col-span-6">
             <div className="lg:sticky lg:top-20">
-              <TermuxSimulator />
+              <OpenCodeTerminal />
 
               {/* Stat strip */}
               <div className="mt-4 grid grid-cols-2 sm:grid-cols-4 border-t border-l border-[#1E2622]">
