@@ -565,7 +565,7 @@ export const OpenCodeTerminal: React.FC = () => {
             { kind: 'out', text: 'opencode -m <model>    pin a model, e.g. -m flint-40b-free' },
             { kind: 'out', text: 'opencode doctor        full system diagnostics' },
             { kind: 'out', text: 'opencode-proxy <cmd>   start · stop · restart · status · test · logs' },
-            { kind: 'out', text: 'cat config             print ~/.opencode-proxy/config.json' },
+            { kind: 'out', text: 'cat config.json        print ~/.opencode-proxy/config.json' },
             { kind: 'out', text: 'clear · pwd · ls · whoami · uname -m' },
             { kind: 'dim', text: 'Tip: inside the CLI press esc to exit, or type /help.' },
           );
@@ -595,7 +595,7 @@ export const OpenCodeTerminal: React.FC = () => {
 
         case 'cat': {
           const path = joined.toLowerCase();
-          if (path.includes('config.json')) {
+          if (path === 'config' || path.includes('config.json')) {
             push({
               kind: 'out',
               text: CONFIG_JSON_EXAMPLE,
