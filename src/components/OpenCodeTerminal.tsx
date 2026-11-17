@@ -3,7 +3,10 @@ import { CornerDownLeft, Play, RotateCcw, ShieldCheck, Terminal as TerminalIcon,
 import { CONFIG_JSON_EXAMPLE } from '../data/runtimeData';
 import {
   DEFAULT_LIVE_MODEL,
+  DEFAULT_LOCAL_BASE,
+  PROVIDER_LABEL,
   fetchRelayStatus,
+  probeLocal,
   loadLiveConfig,
   saveLiveConfig,
   streamChat,
@@ -198,7 +201,11 @@ export const OpenCodeTerminal: React.FC = () => {
   const [formProvider, setFormProvider] = useState<LiveProvider>('openrouter');
   const [formKey, setFormKey] = useState('');
   const [formModel, setFormModel] = useState(DEFAULT_LIVE_MODEL.openrouter);
+  const [formBase, setFormBase] = useState(DEFAULT_LOCAL_BASE);
   const [formError, setFormError] = useState('');
+  const [probe, setProbe] = useState<{ state: 'idle' | 'probing' | 'ok' | 'error'; models: string[]; message: string }>(
+    { state: 'idle', models: [], message: '' },
+  );
   const abortRef = useRef<AbortController | null>(null);
   const liveAccum = useRef('');
 
@@ -507,17 +514,69 @@ export const OpenCodeTerminal: React.FC = () => {
 
   /* ------------------------- live connection form ------------------------- */
   const canUseServerKey = relay?.providers.some((p) => p.id === formProvider && p.serverKey) ?? false;
+  const isLocal = formProvider === 'local';
+
+  const detectLocal = useCallback(async () => {
+    setProbe({ state: 'probing', models: [], message: 'probing the endpoint…' });
+    try {
+      const result = await probeLocal(formBase.trim(), formKey.trim());
+      setProbe({
+        state: 'ok',
+        models: result.models,
+        message: `${result.count} model${result.count === 1 ? '' : 's'} at ${result.base}`,
+      });
+      if (result.models.length && !result.models.includes(formModel)) {
+        setFormModel(result.models[0]);
+      }
+    } catch (error) {
+      setProbe({
+        state: 'error',
+        models: [],
+        message: error instanceof Error ? error.message : 'probe failed',
+      });
+    }
+  }, [formBase, formKey, formModel]);
 
   const connectLive = useCallback(() => {
     const key = formKey.trim();
-    if (!key && !canUseServerKey) {
+    let baseUrl: string | undefined;
+
+    if (isLocal) {
+      const raw = formBase.trim().replace(/\/+$/, '');
+      if (!/^https?:\/\//i.test(raw)) {
+        setFormError('Enter an http(s) endpoint, e.g. http://127.0.0.1:8080/v1');
+        return;
+      }
+      try {
+        const host = new URL(raw).hostname.toLowerCase().replace(/^\[|\]$/g, '');
+        const isPrivate =
+          host === 'localhost' ||
+          host === '::1' ||
+          host.endsWith('.local') ||
+          /^127\./.test(host) ||
+          /^10\./.test(host) ||
+          /^192\.168\./.test(host) ||
+          /^172\.(1[6-9]|2\d|3[01])\./.test(host) ||
+          /^169\.254\./.test(host);
+        if (!isPrivate) {
+          setFormError('Only loopback or private-network endpoints are allowed.');
+          return;
+        }
+      } catch {
+        setFormError('That is not a valid URL.');
+        return;
+      }
+      baseUrl = raw;
+    } else if (!key && !canUseServerKey) {
       setFormError('Paste an API key, or start the server with OPENROUTER_API_KEY set.');
       return;
     }
+
     const next: LiveConfig = {
       provider: formProvider,
       model: formModel.trim() || DEFAULT_LIVE_MODEL[formProvider],
       apiKey: key,
+      baseUrl,
     };
     setLive(next);
     saveLiveConfig(next);
@@ -528,7 +587,7 @@ export const OpenCodeTerminal: React.FC = () => {
     } else {
       push({ kind: 'ok', text: `[✓] live model connected · ${next.provider} · ${next.model}` });
     }
-  }, [canUseServerKey, formKey, formModel, formProvider, push, pushMessage, session]);
+  }, [canUseServerKey, formBase, formKey, formModel, formProvider, isLocal, push, pushMessage, session]);
 
   const disconnectLive = useCallback(() => {
     setLive(null);
@@ -544,11 +603,16 @@ export const OpenCodeTerminal: React.FC = () => {
   const openConnectPanel = useCallback(() => {
     setPanelOpen((open) => !open);
     setFormError('');
+    setProbe({ state: 'idle', models: [], message: '' });
     if (live) {
       setFormProvider(live.provider);
       setFormModel(live.model);
+      setFormKey(live.apiKey);
+      if (live.baseUrl) setFormBase(live.baseUrl);
+    } else if (relay?.local.base) {
+      setFormBase(relay.local.base);
     }
-  }, [live]);
+  }, [live, relay]);
 
   /* ------------------------- shell commands ------------------------- */
   const openSession = useCallback(
@@ -1054,17 +1118,22 @@ export const OpenCodeTerminal: React.FC = () => {
           </div>
 
           <div className="flex flex-wrap items-center gap-1.5">
-            {(['openrouter', 'openai'] as LiveProvider[]).map((provider) => (
+            {(['openrouter', 'openai', 'local'] as LiveProvider[]).map((provider) => (
               <button
                 key={provider}
                 type="button"
                 onClick={() => {
+                  setProbe({ state: 'idle', models: [], message: '' });
+                  setFormError('');
                   setFormProvider(provider);
                   setFormModel((prev) =>
                     prev === DEFAULT_LIVE_MODEL[formProvider] || !prev.trim()
                       ? DEFAULT_LIVE_MODEL[provider]
                       : prev,
                   );
+                  if (provider === 'local' && !formBase.trim()) {
+                    setFormBase(relay?.local.base || DEFAULT_LOCAL_BASE);
+                  }
                 }}
                 className={`px-2.5 py-1 text-[10.5px] border transition-colors cursor-pointer ${
                   formProvider === provider
@@ -1072,20 +1141,73 @@ export const OpenCodeTerminal: React.FC = () => {
                     : 'border-[#26322C] bg-[#121815] text-[#94A39B] hover:text-[#ECF2EE]'
                 }`}
               >
-                {provider === 'openrouter' ? 'OpenRouter' : 'OpenAI'}
+                {PROVIDER_LABEL[provider]}
               </button>
             ))}
-            <span className="ml-auto text-[9.5px] text-[#78897F]">key stays in this browser</span>
+            <span className="ml-auto text-[9.5px] text-[#78897F]">
+              {isLocal ? 'loopback / LAN only' : 'key stays in this browser'}
+            </span>
           </div>
+
+          {isLocal && (
+            <div className="space-y-1.5">
+              <span className="block text-[9.5px] uppercase tracking-wider text-[#78897F]">Endpoint base URL</span>
+              <div className="flex flex-wrap items-center gap-1.5">
+                <input
+                  type="text"
+                  value={formBase}
+                  onChange={(event) => {
+                    setFormBase(event.target.value);
+                    setProbe({ state: 'idle', models: [], message: '' });
+                  }}
+                  placeholder={DEFAULT_LOCAL_BASE}
+                  autoComplete="off"
+                  spellCheck={false}
+                  aria-label="Local endpoint base URL"
+                  className="flex-1 min-w-[180px] bg-[#090C0B] border border-[#26322C] px-2 py-1.5 text-[16px] sm:text-[11px] text-[#ECF2EE] placeholder:text-[#5D6D65] outline-none focus:border-[#10E88A]/60"
+                />
+                <button
+                  type="button"
+                  onClick={detectLocal}
+                  disabled={probe.state === 'probing'}
+                  className="px-2.5 py-1.5 text-[10.5px] border border-[#26322C] bg-[#121815] text-[#C5D2CB] hover:border-[#10E88A]/50 hover:text-[#10E88A] transition-colors cursor-pointer disabled:opacity-50"
+                >
+                  {probe.state === 'probing' ? 'detecting…' : 'detect'}
+                </button>
+              </div>
+              <p
+                className={`text-[9.5px] leading-relaxed ${
+                  probe.state === 'error'
+                    ? 'text-[#F87171]'
+                    : probe.state === 'ok'
+                      ? 'text-[#10E88A]'
+                      : 'text-[#78897F]'
+                }`}
+              >
+                {probe.message ||
+                  (relay?.local.base
+                    ? `relay default: ${relay.local.base} · detect lists its models`
+                    : 'point this at opencode2api, vLLM, or any OpenAI-compatible gateway on this machine or LAN')}
+              </p>
+            </div>
+          )}
 
           <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
             <label className="block">
-              <span className="block text-[9.5px] uppercase tracking-wider text-[#78897F] mb-1">API key</span>
+              <span className="block text-[9.5px] uppercase tracking-wider text-[#78897F] mb-1">
+                API key {isLocal && <span className="normal-case tracking-normal">(optional)</span>}
+              </span>
               <input
                 type="password"
                 value={formKey}
                 onChange={(event) => setFormKey(event.target.value)}
-                placeholder={canUseServerKey ? 'server key available — optional' : 'sk-…'}
+                placeholder={
+                  isLocal
+                    ? 'local-test-key (optional)'
+                    : canUseServerKey
+                      ? 'server key available — optional'
+                      : 'sk-…'
+                }
                 autoComplete="off"
                 spellCheck={false}
                 aria-label="Provider API key"
@@ -1102,15 +1224,28 @@ export const OpenCodeTerminal: React.FC = () => {
                 autoComplete="off"
                 spellCheck={false}
                 aria-label="Live model id"
+                list="opencode-local-models"
                 className="w-full bg-[#090C0B] border border-[#26322C] px-2 py-1.5 text-[16px] sm:text-[11px] text-[#ECF2EE] placeholder:text-[#5D6D65] outline-none focus:border-[#10E88A]/60"
               />
+              {probe.models.length > 0 && (
+                <datalist id="opencode-local-models">
+                  {probe.models.map((model) => (
+                    <option key={model} value={model} />
+                  ))}
+                </datalist>
+              )}
             </label>
           </div>
 
-          {canUseServerKey && (
+          {!isLocal && canUseServerKey && (
             <p className="text-[10px] text-[#8A9A91]">
-              This server already holds a {formProvider === 'openai' ? 'OpenAI' : 'OpenRouter'} key — you can connect
-              with the field empty.
+              This server already holds a {PROVIDER_LABEL[formProvider]} key — you can connect with the field empty.
+            </p>
+          )}
+          {isLocal && relay?.local.base && (
+            <p className="text-[10px] text-[#8A9A91]">
+              Relay default: <span className="text-[#C8D5CE]">{relay.local.base}</span> — this only resolves if the
+              site&apos;s server runs on the same machine or network as the gateway.
             </p>
           )}
           {formError && <p className="text-[10px] text-[#F87171]">{formError}</p>}
@@ -1279,7 +1414,7 @@ export const OpenCodeTerminal: React.FC = () => {
                 : 'OpenRouter bridge on 127.0.0.1:8085 · BYOK models alongside the free pool'}
               <div className={`mt-1 ${live ? 'text-[#10E88A]' : 'text-[#78897F]'}`}>
                 {live
-                  ? `live · ${live.provider} · replies stream from your key through this site's relay`
+                  ? `live · ${PROVIDER_LABEL[live.provider]}${live.baseUrl ? ` · ${live.baseUrl}` : ''} · replies stream through this site's relay`
                   : 'demo session · replies are simulated in your browser'}
               </div>
             </div>

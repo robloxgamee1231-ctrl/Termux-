@@ -1,44 +1,54 @@
 /**
  * Minimal OpenAI-compatible relay used by the in-browser OpenCode terminal.
  *
- * - The browser never talks to a model provider directly (no CORS, no exposed
- *   provider URLs, and keys stay out of the page's network tab except for the
- *   single same-origin request that carries them here).
- * - A provider key can come from the request (`x-provider-key`) or from the
- *   server environment. Nothing is ever written to disk or to logs.
- * - Upstream base URLs are fixed; `OPENCODE_API_BASE` exists only so the relay
- *   can be pointed at a local mock during testing or a self-hosted endpoint.
+ * Providers
+ *   - `openrouter` / `openai`: fixed cloud base URLs, key from the request
+ *     (`x-provider-key`) or the server environment.
+ *   - `local`: a loopback / LAN OpenAI-compatible endpoint such as
+ *     opencode2api on `http://127.0.0.1:8080/v1`. Only private or loopback hosts
+ *     are accepted, so the relay can never be used as an open proxy.
+ *
+ * Keys are never written to disk or logs. Upstream responses are streamed
+ * straight through as SSE.
  */
 
 const PROVIDERS = {
   openrouter: {
     label: 'OpenRouter',
     base: 'https://openrouter.ai/api/v1',
-    envKeys: ['OPENROUTER_API_KEY'],
+    requiresKey: true,
   },
   openai: {
     label: 'OpenAI',
     base: 'https://api.openai.com/v1',
-    envKeys: ['OPENAI_API_KEY'],
+    requiresKey: true,
+  },
+  local: {
+    label: 'Local endpoint',
+    base: '',
+    requiresKey: false,
   },
 };
 
 const MAX_BODY_BYTES = 1_000_000;
 const MAX_MESSAGES = 40;
 const RATE_WINDOW_MS = 60_000;
-const RATE_MAX = 40;
+const CHAT_RATE_MAX = 40;
+const PROBE_RATE_MAX = 20;
+const PROBE_TIMEOUT_MS = 4_000;
 
-/** Tiny in-memory limiter so an open relay cannot be used as a free API proxy. */
+/** Tiny in-memory limiters so an open relay cannot be used as a free proxy. */
 const hitLog = new Map();
 
-function rateLimited(req) {
+function rateLimited(req, bucket, max) {
   const ip = req.socket?.remoteAddress || 'unknown';
+  const key = `${bucket}:${ip}`;
   const now = Date.now();
-  const hits = (hitLog.get(ip) || []).filter((stamp) => now - stamp < RATE_WINDOW_MS);
+  const hits = (hitLog.get(key) || []).filter((stamp) => now - stamp < RATE_WINDOW_MS);
   hits.push(now);
-  hitLog.set(ip, hits);
+  hitLog.set(key, hits);
   if (hitLog.size > 5000) hitLog.clear();
-  return hits.length > RATE_MAX;
+  return hits.length > max;
 }
 
 function json(res, status, payload) {
@@ -67,30 +77,84 @@ function readBody(req) {
   });
 }
 
-function serverKeyFor(provider) {
-  const env = process.env;
-  if (provider === 'openai') return env.OPENAI_API_KEY || env.OPENCODE_API_KEY || '';
-  return env.OPENROUTER_API_KEY || env.OPENCODE_API_KEY || '';
+async function readJson(req) {
+  try {
+    return { body: JSON.parse(await readBody(req)) };
+  } catch (error) {
+    return { error: error.message === 'payload_too_large' ? 'payload_too_large' : 'invalid_json' };
+  }
 }
 
-function resolveBase(provider) {
-  const override = process.env.OPENCODE_API_BASE;
-  if (override) return override.replace(/\/+$/, '');
-  return PROVIDERS[provider].base;
+/* ------------------------------------------------------------------ */
+/* Local endpoint validation                                           */
+/* ------------------------------------------------------------------ */
+
+function isPrivateHost(hostname) {
+  const host = hostname.toLowerCase().replace(/^\[|\]$/g, '');
+  if (host === 'localhost' || host === '::1' || host === '0.0.0.0') return true;
+  if (host.endsWith('.local')) return true;
+  if (/^127\./.test(host)) return true;
+  if (/^10\./.test(host)) return true;
+  if (/^192\.168\./.test(host)) return true;
+  if (/^172\.(1[6-9]|2\d|3[01])\./.test(host)) return true;
+  if (/^169\.254\./.test(host)) return true;
+  return false;
+}
+
+/**
+ * Accepts only http(s) URLs on loopback / private / .local hosts and returns a
+ * normalised base (`http://127.0.0.1:8080/v1`), or null when unusable.
+ */
+export function normalizeLocalBase(raw) {
+  if (!raw || typeof raw !== 'string' || raw.length > 300) return null;
+  let url;
+  try {
+    url = new URL(raw.trim());
+  } catch {
+    return null;
+  }
+  if (url.protocol !== 'http:' && url.protocol !== 'https:') return null;
+  if (url.username || url.password) return null;
+  if (url.search || url.hash) return null;
+  if (!isPrivateHost(url.hostname)) return null;
+  const path = url.pathname.replace(/\/+$/, '');
+  return `${url.origin}${path}`;
+}
+
+export function configuredLocalBase() {
+  return normalizeLocalBase(process.env.OPENCODE_LOCAL_BASE || process.env.OPENCODE_API_BASE || '');
+}
+
+function serverKeyFor(provider, localBase) {
+  const env = process.env;
+  if (provider === 'openai') return env.OPENAI_API_KEY || env.OPENCODE_API_KEY || '';
+  if (provider === 'openrouter') return env.OPENROUTER_API_KEY || env.OPENCODE_API_KEY || '';
+  if (provider === 'local' && localBase) {
+    return env.OPENCODE_LOCAL_KEY || env.OPENCODE_API_KEY || '';
+  }
+  return '';
 }
 
 export function apiStatus() {
-  const providers = Object.entries(PROVIDERS).map(([id, config]) => ({
-    id,
-    label: config.label,
-    serverKey: Boolean(serverKeyFor(id)),
-  }));
+  const localBase = configuredLocalBase();
   return {
     ok: true,
-    providers,
-    customBase: Boolean(process.env.OPENCODE_API_BASE),
+    providers: Object.entries(PROVIDERS).map(([id, config]) => ({
+      id,
+      label: config.label,
+      requiresKey: config.requiresKey,
+      serverKey: Boolean(serverKeyFor(id, localBase)),
+    })),
+    local: {
+      base: localBase,
+      serverKey: Boolean(serverKeyFor('local', localBase)),
+    },
   };
 }
+
+/* ------------------------------------------------------------------ */
+/* Upstream helpers                                                    */
+/* ------------------------------------------------------------------ */
 
 /**
  * Transforms a non-streaming chat completion JSON body into a single SSE frame
@@ -106,32 +170,87 @@ function jsonToSse(payload) {
   return `data: ${JSON.stringify(frame)}\n\ndata: [DONE]\n\n`;
 }
 
-export async function handleApi(req, res, pathname) {
-  if (pathname === '/api/status') {
-    if (req.method !== 'GET') return json(res, 405, { error: 'method_not_allowed' });
-    return json(res, 200, apiStatus());
+function providerLabel(id) {
+  return PROVIDERS[id]?.label || id;
+}
+
+/* ------------------------------------------------------------------ */
+/* Routes                                                              */
+/* ------------------------------------------------------------------ */
+
+async function handleProbe(req, res) {
+  if (req.method !== 'POST') return json(res, 405, { error: 'method_not_allowed' });
+  if (rateLimited(req, 'probe', PROBE_RATE_MAX)) {
+    return json(res, 429, { error: 'rate_limited', scope: 'probe' });
   }
 
-  if (pathname !== '/api/chat') {
-    return json(res, 404, { error: 'not_found' });
+  const parsed = await readJson(req);
+  if (parsed.error) {
+    return json(res, parsed.error === 'payload_too_large' ? 413 : 400, { error: parsed.error });
   }
 
-  if (req.method !== 'POST') {
-    return json(res, 405, { error: 'method_not_allowed' });
+  const body = parsed.body || {};
+  const base = normalizeLocalBase(body.baseUrl) || configuredLocalBase();
+  if (!base) {
+    return json(res, 400, { error: 'invalid_base' });
   }
 
-  let body;
+  const headerKey = String(req.headers['x-provider-key'] || '').trim();
+  const key = headerKey || serverKeyFor('local', base);
+
+  let upstream;
   try {
-    body = JSON.parse(await readBody(req));
-  } catch (error) {
-    return json(res, error.message === 'payload_too_large' ? 413 : 400, {
-      error: error.message === 'payload_too_large' ? 'payload_too_large' : 'invalid_json',
+    upstream = await fetch(`${base}/models`, {
+      method: 'GET',
+      redirect: 'manual',
+      signal: AbortSignal.timeout(PROBE_TIMEOUT_MS),
+      headers: key ? { Authorization: `Bearer ${key}` } : {},
+    });
+  } catch {
+    return json(res, 502, { error: 'probe_unreachable', base });
+  }
+
+  if (!upstream.ok) {
+    return json(res, 502, { error: 'probe_failed', status: upstream.status, base });
+  }
+
+  let payload;
+  try {
+    payload = await upstream.json();
+  } catch {
+    return json(res, 502, { error: 'probe_bad_payload', base });
+  }
+
+  const rawList = Array.isArray(payload?.data)
+    ? payload.data
+    : Array.isArray(payload?.models)
+      ? payload.models
+      : [];
+
+  const models = rawList
+    .map((entry) => (typeof entry === 'string' ? entry : entry?.id || entry?.name || entry?.model))
+    .filter((id) => typeof id === 'string' && id.length > 0)
+    .slice(0, 200);
+
+  return json(res, 200, { ok: true, base, models, count: models.length });
+}
+
+async function handleChat(req, res) {
+  if (req.method !== 'POST') return json(res, 405, { error: 'method_not_allowed' });
+  if (rateLimited(req, 'chat', CHAT_RATE_MAX)) {
+    return json(res, 429, {
+      error: 'rate_limited',
+      scope: 'chat',
+      limit: CHAT_RATE_MAX,
+      windowSeconds: RATE_WINDOW_MS / 1000,
     });
   }
 
-  if (rateLimited(req)) {
-    return json(res, 429, { error: 'rate_limited', limit: RATE_MAX, windowSeconds: RATE_WINDOW_MS / 1000 });
+  const parsed = await readJson(req);
+  if (parsed.error) {
+    return json(res, parsed.error === 'payload_too_large' ? 413 : 400, { error: parsed.error });
   }
+  const body = parsed.body || {};
 
   const provider = String(body.provider || 'openrouter');
   if (!PROVIDERS[provider]) {
@@ -152,27 +271,37 @@ export async function handleApi(req, res, pathname) {
     return json(res, 400, { error: 'missing_messages' });
   }
 
+  let base;
+  if (provider === 'local') {
+    base = normalizeLocalBase(body.baseUrl) || configuredLocalBase();
+    if (!base) return json(res, 400, { error: 'invalid_base' });
+  } else {
+    base = PROVIDERS[provider].base;
+  }
+
   const headerKey = String(req.headers['x-provider-key'] || '').trim();
-  const key = headerKey || serverKeyFor(provider);
-  if (!key) {
+  const key = headerKey || serverKeyFor(provider, base);
+
+  if (PROVIDERS[provider].requiresKey && !key) {
     return json(res, 401, { error: 'no_key' });
   }
 
-  const base = resolveBase(provider);
   const controller = new AbortController();
   res.on('close', () => controller.abort());
+
+  const headers = {
+    'Content-Type': 'application/json',
+    'X-Title': 'OpenCode Termux Unlimited',
+  };
+  if (key) headers.Authorization = `Bearer ${key}`;
+  if (provider !== 'local') headers['HTTP-Referer'] = req.headers.origin || 'https://localhost';
 
   let upstream;
   try {
     upstream = await fetch(`${base}/chat/completions`, {
       method: 'POST',
       signal: controller.signal,
-      headers: {
-        Authorization: `Bearer ${key}`,
-        'Content-Type': 'application/json',
-        'HTTP-Referer': req.headers.origin || 'https://localhost',
-        'X-Title': 'OpenCode Termux Unlimited',
-      },
+      headers,
       body: JSON.stringify({
         model,
         messages: cleaned,
@@ -182,7 +311,7 @@ export async function handleApi(req, res, pathname) {
       }),
     });
   } catch {
-    return json(res, 502, { error: 'upstream_unreachable' });
+    return json(res, 502, { error: 'upstream_unreachable', provider: providerLabel(provider), base });
   }
 
   if (!upstream.ok) {
@@ -196,6 +325,7 @@ export async function handleApi(req, res, pathname) {
       error: 'upstream_error',
       status: upstream.status,
       detail,
+      provider: providerLabel(provider),
     });
   }
 
@@ -234,4 +364,16 @@ export async function handleApi(req, res, pathname) {
   } finally {
     res.end();
   }
+}
+
+export async function handleApi(req, res, pathname) {
+  if (pathname === '/api/status') {
+    if (req.method !== 'GET') return json(res, 405, { error: 'method_not_allowed' });
+    return json(res, 200, apiStatus());
+  }
+
+  if (pathname === '/api/chat') return handleChat(req, res);
+  if (pathname === '/api/local/probe') return handleProbe(req, res);
+
+  return json(res, 404, { error: 'not_found' });
 }

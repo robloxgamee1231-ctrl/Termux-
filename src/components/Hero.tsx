@@ -143,8 +143,8 @@ export const Hero: React.FC = () => {
 
               <p className="mt-3 text-[11px] font-mono text-[#78897F] leading-relaxed">
                 <span className="text-[#10E88A]">&gt;_</span> Interactive demo — click the terminal and type{' '}
-                <span className="text-[#C8D5CE]">opencode</span>. Replies are simulated in your browser; nothing
-                is sent anywhere.
+                <span className="text-[#C8D5CE]">opencode</span>. Connect a local gateway or your own API key for
+                live replies; otherwise everything is simulated in your browser.
               </p>
             </div>
           </div>

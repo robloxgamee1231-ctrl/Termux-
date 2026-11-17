@@ -3,7 +3,8 @@
  * relay so live inference works outside the Vite dev server.
  *
  *   npm run build && npm start
- *   OPENROUTER_API_KEY=sk-or-... PORT=8080 npm start
+ *   OPENROUTER_API_KEY=sk-or-... PORT=3000 npm start
+ *   OPENCODE_LOCAL_BASE=http://127.0.0.1:8080/v1 npm start
  */
 import http from 'node:http';
 import { createReadStream, existsSync, statSync } from 'node:fs';
@@ -12,7 +13,7 @@ import { fileURLToPath } from 'node:url';
 import { handleApi } from './api.mjs';
 
 const root = resolve(fileURLToPath(new URL('../dist', import.meta.url)));
-const port = Number(process.env.PORT || 8080);
+const port = Number(process.env.PORT || 3000);
 const host = process.env.HOST || '0.0.0.0';
 
 const MIME = {

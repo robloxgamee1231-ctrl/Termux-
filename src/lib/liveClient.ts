@@ -1,9 +1,11 @@
-export type LiveProvider = 'openrouter' | 'openai';
+export type LiveProvider = 'openrouter' | 'openai' | 'local';
 
 export interface LiveConfig {
   provider: LiveProvider;
   model: string;
   apiKey: string;
+  /** Only used by the `local` provider — loopback or LAN OpenAI-compatible base. */
+  baseUrl?: string;
 }
 
 export interface ChatMessage {
@@ -11,10 +13,24 @@ export interface ChatMessage {
   content: string;
 }
 
+export interface RelayProviderInfo {
+  id: LiveProvider;
+  label: string;
+  requiresKey: boolean;
+  serverKey: boolean;
+}
+
 export interface RelayStatus {
   ok: boolean;
-  providers: Array<{ id: LiveProvider; label: string; serverKey: boolean }>;
-  customBase: boolean;
+  providers: RelayProviderInfo[];
+  local: { base: string | null; serverKey: boolean };
+}
+
+export interface ProbeResult {
+  ok: boolean;
+  base: string;
+  models: string[];
+  count: number;
 }
 
 const STORAGE_KEY = 'opencode-termux-live';
@@ -22,19 +38,37 @@ const STORAGE_KEY = 'opencode-termux-live';
 export const DEFAULT_LIVE_MODEL: Record<LiveProvider, string> = {
   openrouter: 'deepseek/deepseek-chat',
   openai: 'gpt-4o-mini',
+  local: 'deepseek-v4.1-flash-free',
 };
+
+export const DEFAULT_LOCAL_BASE = 'http://127.0.0.1:8080/v1';
+
+export const PROVIDER_LABEL: Record<LiveProvider, string> = {
+  openrouter: 'OpenRouter',
+  openai: 'OpenAI',
+  local: 'Local endpoint',
+};
+
+const PROVIDERS: LiveProvider[] = ['openrouter', 'openai', 'local'];
 
 export function loadLiveConfig(): LiveConfig | null {
   try {
     const raw = window.localStorage.getItem(STORAGE_KEY);
     if (!raw) return null;
     const parsed = JSON.parse(raw) as Partial<LiveConfig>;
-    if (parsed.provider !== 'openrouter' && parsed.provider !== 'openai') return null;
+    if (!parsed.provider || !PROVIDERS.includes(parsed.provider)) return null;
     if (typeof parsed.model !== 'string' || !parsed.model) return null;
+    const baseUrl =
+      parsed.provider === 'local'
+        ? typeof parsed.baseUrl === 'string' && parsed.baseUrl
+          ? parsed.baseUrl
+          : DEFAULT_LOCAL_BASE
+        : undefined;
     return {
       provider: parsed.provider,
       model: parsed.model,
       apiKey: typeof parsed.apiKey === 'string' ? parsed.apiKey : '',
+      baseUrl,
     };
   } catch {
     return null;
@@ -63,6 +97,35 @@ export async function fetchRelayStatus(): Promise<RelayStatus | null> {
   }
 }
 
+/** Asks the relay to call `GET <base>/models` so the UI can list local models. */
+export async function probeLocal(baseUrl: string, apiKey = ''): Promise<ProbeResult> {
+  let res: Response;
+  try {
+    res = await fetch('/api/local/probe', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        ...(apiKey ? { 'x-provider-key': apiKey } : {}),
+      },
+      body: JSON.stringify({ baseUrl }),
+    });
+  } catch {
+    throw new LiveError('Could not reach the relay on this site.', 0);
+  }
+
+  let payload: unknown = null;
+  try {
+    payload = await res.json();
+  } catch {
+    payload = null;
+  }
+
+  if (!res.ok) {
+    throw new LiveError(describeRelayError(res.status, payload), res.status);
+  }
+  return payload as ProbeResult;
+}
+
 export interface StreamOptions {
   config: LiveConfig;
   messages: ChatMessage[];
@@ -81,9 +144,23 @@ export class LiveError extends Error {
 }
 
 function describeRelayError(status: number, payload: unknown): string {
-  const record = (payload ?? {}) as { error?: string; detail?: string };
+  const record = (payload ?? {}) as { error?: string; detail?: string; status?: number; provider?: string };
+  const provider = record.provider || 'the provider';
+
   if (status === 401 || record.error === 'no_key') {
     return 'No API key — add one in Connect, or set OPENROUTER_API_KEY on the server.';
+  }
+  if (record.error === 'rate_limited') {
+    return 'Rate limit hit on the relay — wait a moment and try again.';
+  }
+  if (record.error === 'invalid_base') {
+    return 'That endpoint is not allowed. Use a loopback or private-network http(s) URL such as http://127.0.0.1:8080/v1.';
+  }
+  if (record.error === 'probe_unreachable') {
+    return 'Nothing answered at that endpoint. Is the local gateway running (opencode-proxy start)?';
+  }
+  if (record.error === 'probe_failed' || record.error === 'probe_bad_payload') {
+    return `The endpoint answered but did not return a model list (${record.status || 'no status'}).`;
   }
   if (record.error === 'upstream_error') {
     let detail = record.detail || '';
@@ -94,13 +171,10 @@ function describeRelayError(status: number, payload: unknown): string {
     } catch {
       // keep raw detail
     }
-    return `Provider error ${status}${detail ? `: ${detail.slice(0, 300)}` : ''}`;
-  }
-  if (record.error === 'rate_limited') {
-    return 'Rate limit hit on the relay (40 requests/minute) — wait a moment.';
+    return `${provider} error ${status}${detail ? `: ${detail.slice(0, 300)}` : ''}`;
   }
   if (record.error === 'upstream_unreachable') {
-    return 'Provider unreachable from this server — check outbound network access.';
+    return `Could not reach ${provider} from this server — check that the endpoint is running and reachable.`;
   }
   return `Relay error ${status}${record.error ? ` (${record.error})` : ''}`;
 }
@@ -122,6 +196,7 @@ export async function streamChat({ config, messages, signal, onDelta }: StreamOp
       body: JSON.stringify({
         provider: config.provider,
         model: config.model,
+        baseUrl: config.baseUrl,
         messages,
       }),
     });
