@@ -30,3 +30,8 @@ pnpm-debug.log*
 
 # TypeScript build info
 *.tsbuildinfo
+
+# Local secrets
+.env
+.env.*
+!.env.example

@@ -1,6 +1,17 @@
 import React, { useCallback, useEffect, useRef, useState } from 'react';
 import { CornerDownLeft, Play, RotateCcw, ShieldCheck, Terminal as TerminalIcon, Zap } from 'lucide-react';
 import { CONFIG_JSON_EXAMPLE } from '../data/runtimeData';
+import {
+  DEFAULT_LIVE_MODEL,
+  fetchRelayStatus,
+  loadLiveConfig,
+  saveLiveConfig,
+  streamChat,
+  type ChatMessage,
+  type LiveConfig,
+  type LiveProvider,
+  type RelayStatus,
+} from '../lib/liveClient';
 
 /* ------------------------------------------------------------------ */
 /* Types                                                               */
@@ -181,6 +192,15 @@ export const OpenCodeTerminal: React.FC = () => {
   const [tuiDraft, setTuiDraft] = useState('');
   const [streamingText, setStreamingText] = useState<string | null>(null);
   const [rotating, setRotating] = useState(false);
+  const [live, setLive] = useState<LiveConfig | null>(() => loadLiveConfig());
+  const [relay, setRelay] = useState<RelayStatus | null>(null);
+  const [panelOpen, setPanelOpen] = useState(false);
+  const [formProvider, setFormProvider] = useState<LiveProvider>('openrouter');
+  const [formKey, setFormKey] = useState('');
+  const [formModel, setFormModel] = useState(DEFAULT_LIVE_MODEL.openrouter);
+  const [formError, setFormError] = useState('');
+  const abortRef = useRef<AbortController | null>(null);
+  const liveAccum = useRef('');
 
   const idRef = useRef(100);
   const timersRef = useRef<number[]>([]);
@@ -204,6 +224,16 @@ export const OpenCodeTerminal: React.FC = () => {
     return () => {
       timers.forEach((t) => window.clearTimeout(t));
       if (streamTimerRef.current) window.clearInterval(streamTimerRef.current);
+    };
+  }, []);
+
+  useEffect(() => {
+    let active = true;
+    fetchRelayStatus().then((status) => {
+      if (active && status) setRelay(status);
+    });
+    return () => {
+      active = false;
     };
   }, []);
 
@@ -266,19 +296,80 @@ export const OpenCodeTerminal: React.FC = () => {
       window.clearInterval(streamTimerRef.current);
       streamTimerRef.current = null;
     }
+    abortRef.current?.abort();
+    abortRef.current = null;
     setStreamingText(null);
     setRotating(false);
     if (session) {
       push({
         kind: 'ok',
-        text: `[✓] session saved · model ${session.model} · gateway 127.0.0.1:8080`,
+        text: live
+          ? `[✓] session closed · live ${live.provider} · ${live.model}`
+          : `[✓] session saved · model ${session.model} · gateway 127.0.0.1:8080`,
       });
     }
     setSession(null);
     setMessages([]);
     setTuiDraft('');
     later(() => shellInputRef.current?.focus(), 60);
-  }, [later, push, session]);
+  }, [later, live, push, session]);
+
+  /* ------------------------- live model streaming ------------------------- */
+  const runLivePrompt = useCallback(
+    (text: string) => {
+      if (!live) return;
+
+      const prior: ChatMessage[] = messages
+        .filter((m) => m.role !== 'system')
+        .map((m) => ({ role: m.role as 'user' | 'assistant', content: m.text }));
+
+      pushMessage('user', text);
+      liveAccum.current = '';
+      setStreamingText('');
+
+      const controller = new AbortController();
+      abortRef.current = controller;
+
+      streamChat({
+        config: live,
+        messages: [...prior, { role: 'user', content: text }],
+        signal: controller.signal,
+        onDelta: (_delta, accumulated) => {
+          liveAccum.current = accumulated;
+          setStreamingText(accumulated);
+        },
+      })
+        .then((full) => {
+          setStreamingText(null);
+          const body = full.trim();
+          if (body) pushMessage('assistant', body);
+          else pushMessage('system', 'provider returned an empty response');
+        })
+        .catch((error: unknown) => {
+          setStreamingText(null);
+          if ((error as Error)?.name === 'AbortError') {
+            const partial = liveAccum.current.trim();
+            if (partial) pushMessage('assistant', partial);
+            pushMessage('system', 'stream aborted');
+            return;
+          }
+          const message = error instanceof Error ? error.message : 'live request failed';
+          const unreachable = /unreachable|Could not reach/i.test(message);
+          pushMessage(
+            'system',
+            unreachable ? `${message} · falling back to the local simulation` : message,
+          );
+          if (unreachable) {
+            later(() => startStream(buildReply(text, live.model)), 400);
+          }
+        })
+        .finally(() => {
+          abortRef.current = null;
+          liveAccum.current = '';
+        });
+    },
+    [later, live, messages, pushMessage, startStream],
+  );
 
   const sendTuiPrompt = useCallback(
     (raw: string, explicitSession?: Session) => {
@@ -294,29 +385,67 @@ export const OpenCodeTerminal: React.FC = () => {
         const [cmd, ...rest] = text.split(/\s+/);
         switch (cmd) {
           case '/help':
-            pushMessage('system', 'commands: /models · /model <id> · /proxy status · /clear · /exit');
+            pushMessage(
+              'system',
+              'commands: /models · /model <id> · /proxy status · /connect · /disconnect · /clear · /exit',
+            );
             return;
           case '/models': {
+            if (live) {
+              pushMessage(
+                'system',
+                `live · ${live.provider} · current model ${live.model}\nset another with /model <provider-model-id>`,
+              );
+              return;
+            }
             const list = activeSession.mode === 'mode2' ? MODE2_MODELS : MODE1_MODELS;
             pushMessage('system', `${list.length} models available:\n${list.map((m) => `  · ${m}`).join('\n')}`);
             return;
           }
           case '/model': {
-            const list = activeSession.mode === 'mode2' ? MODE2_MODELS : MODE1_MODELS;
             const wanted = rest.join(' ').trim();
+
+            if (live) {
+              if (!wanted) {
+                pushMessage('system', `usage: /model <provider-model-id> · current: ${live.model}`);
+              } else {
+                const next = { ...live, model: wanted };
+                setLive(next);
+                saveLiveConfig(next);
+                pushMessage('system', `live model → ${wanted}`);
+              }
+              return;
+            }
+
+            const list = activeSession.mode === 'mode2' ? MODE2_MODELS : MODE1_MODELS;
             const match = list.find(
               (m) => m === wanted || m.includes(wanted.toLowerCase()) || m.startsWith(wanted.toLowerCase()),
             );
             if (!wanted) {
               pushMessage('system', `usage: /model <id> · current: ${activeSession.model}`);
             } else if (!match) {
-              pushMessage('system', `model not in the ${activeSession.mode === 'mode1' ? 'Mode 1' : 'Mode 2'} pool: ${wanted}`);
+              pushMessage(
+                'system',
+                `model not in the ${activeSession.mode === 'mode1' ? 'Mode 1' : 'Mode 2'} pool: ${wanted}`,
+              );
             } else {
               setSession({ ...activeSession, model: match });
               pushMessage('system', `model → ${match}`);
             }
             return;
           }
+          case '/connect':
+            setPanelOpen(true);
+            return;
+          case '/disconnect':
+            if (!live) {
+              pushMessage('system', 'not connected — running the local simulation');
+            } else {
+              setLive(null);
+              saveLiveConfig(null);
+              pushMessage('system', 'disconnected · back to simulated replies');
+            }
+            return;
           case '/proxy':
             pushMessage(
               'system',
@@ -337,6 +466,13 @@ export const OpenCodeTerminal: React.FC = () => {
         }
       }
 
+      /* ---- real model path ---- */
+      if (live) {
+        runLivePrompt(text);
+        return;
+      }
+
+      /* ---- simulated path ---- */
       pushMessage('user', text);
 
       const lower = text.toLowerCase();
@@ -366,8 +502,53 @@ export const OpenCodeTerminal: React.FC = () => {
       const delay = isAudit ? 1500 : isQuota ? 1200 : 500;
       later(() => startStream(buildReply(text, activeSession.model)), delay);
     },
-    [exitTui, later, pushMessage, session, startStream, streamingText],
+    [exitTui, later, live, pushMessage, runLivePrompt, session, startStream, streamingText],
   );
+
+  /* ------------------------- live connection form ------------------------- */
+  const canUseServerKey = relay?.providers.some((p) => p.id === formProvider && p.serverKey) ?? false;
+
+  const connectLive = useCallback(() => {
+    const key = formKey.trim();
+    if (!key && !canUseServerKey) {
+      setFormError('Paste an API key, or start the server with OPENROUTER_API_KEY set.');
+      return;
+    }
+    const next: LiveConfig = {
+      provider: formProvider,
+      model: formModel.trim() || DEFAULT_LIVE_MODEL[formProvider],
+      apiKey: key,
+    };
+    setLive(next);
+    saveLiveConfig(next);
+    setPanelOpen(false);
+    setFormError('');
+    if (session) {
+      pushMessage('system', `live · ${next.provider} · ${next.model}`);
+    } else {
+      push({ kind: 'ok', text: `[✓] live model connected · ${next.provider} · ${next.model}` });
+    }
+  }, [canUseServerKey, formKey, formModel, formProvider, push, pushMessage, session]);
+
+  const disconnectLive = useCallback(() => {
+    setLive(null);
+    saveLiveConfig(null);
+    setPanelOpen(false);
+    if (session) {
+      pushMessage('system', 'disconnected · back to simulated replies');
+    } else {
+      push({ kind: 'warn', text: '[!] live model disconnected' });
+    }
+  }, [push, pushMessage, session]);
+
+  const openConnectPanel = useCallback(() => {
+    setPanelOpen((open) => !open);
+    setFormError('');
+    if (live) {
+      setFormProvider(live.provider);
+      setFormModel(live.model);
+    }
+  }, [live]);
 
   /* ------------------------- shell commands ------------------------- */
   const openSession = useCallback(
@@ -381,7 +562,7 @@ export const OpenCodeTerminal: React.FC = () => {
           text:
             mode === 'mode1'
               ? 'Mode 1 · free unlimited proxy · 127.0.0.1:8080 · no API key'
-              : 'Mode 2 · OpenRouter bridge · 127.0.0.1:8085 · demo session',
+              : 'Mode 2 · OpenRouter bridge · 127.0.0.1:8085',
         },
       ]);
       setTuiDraft('');
@@ -827,10 +1008,21 @@ export const OpenCodeTerminal: React.FC = () => {
           <span className="text-[11px] font-mono text-[#94A39B] tracking-tight">
             u0_a291@termux:~ <span className="text-[#8A9A91]">(aarch64)</span>
           </span>
-          <span className="hidden sm:inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-mono border border-[#10E88A]/30 bg-[#10E88A]/10 text-[#10E88A]">
-            <span className="w-1 h-1 rounded-full bg-[#10E88A] animate-pulse-dot" />
-            interactive
-          </span>
+          <button
+            type="button"
+            onClick={openConnectPanel}
+            title={live ? 'Live model settings' : 'Connect a real model'}
+            className={`hidden sm:inline-flex items-center gap-1 px-1.5 py-0.5 text-[10px] font-mono border transition-colors cursor-pointer ${
+              live
+                ? 'border-[#10E88A]/45 bg-[#10E88A]/12 text-[#10E88A] hover:bg-[#10E88A]/20'
+                : 'border-[#F59E0B]/35 bg-[#F59E0B]/10 text-[#F59E0B] hover:bg-[#F59E0B]/20'
+            }`}
+          >
+            <span
+              className={`w-1 h-1 rounded-full animate-pulse-dot ${live ? 'bg-[#10E88A]' : 'bg-[#F59E0B]'}`}
+            />
+            {live ? `live · ${live.provider}` : 'connect api'}
+          </button>
         </div>
 
         <div className="flex items-center gap-1.5 text-[11px] font-mono tabular-nums">
@@ -844,6 +1036,109 @@ export const OpenCodeTerminal: React.FC = () => {
           </span>
         </div>
       </div>
+
+      {/* ================= LIVE CONNECTION PANEL ================= */}
+      {panelOpen && (
+        <div className="border-b border-[#1E2622] bg-[#0E1411] px-3.5 py-3 space-y-2.5 font-mono">
+          <div className="flex items-center justify-between gap-2">
+            <div className="text-[10.5px] uppercase tracking-wider text-[#10E88A]">
+              {live ? 'Live model settings' : 'Connect a live model'}
+            </div>
+            <button
+              type="button"
+              onClick={() => setPanelOpen(false)}
+              className="text-[10.5px] text-[#78897F] hover:text-[#ECF2EE] transition-colors cursor-pointer"
+            >
+              close ✕
+            </button>
+          </div>
+
+          <div className="flex flex-wrap items-center gap-1.5">
+            {(['openrouter', 'openai'] as LiveProvider[]).map((provider) => (
+              <button
+                key={provider}
+                type="button"
+                onClick={() => {
+                  setFormProvider(provider);
+                  setFormModel((prev) =>
+                    prev === DEFAULT_LIVE_MODEL[formProvider] || !prev.trim()
+                      ? DEFAULT_LIVE_MODEL[provider]
+                      : prev,
+                  );
+                }}
+                className={`px-2.5 py-1 text-[10.5px] border transition-colors cursor-pointer ${
+                  formProvider === provider
+                    ? 'border-[#10E88A] bg-[#10E88A]/15 text-[#10E88A]'
+                    : 'border-[#26322C] bg-[#121815] text-[#94A39B] hover:text-[#ECF2EE]'
+                }`}
+              >
+                {provider === 'openrouter' ? 'OpenRouter' : 'OpenAI'}
+              </button>
+            ))}
+            <span className="ml-auto text-[9.5px] text-[#78897F]">key stays in this browser</span>
+          </div>
+
+          <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+            <label className="block">
+              <span className="block text-[9.5px] uppercase tracking-wider text-[#78897F] mb-1">API key</span>
+              <input
+                type="password"
+                value={formKey}
+                onChange={(event) => setFormKey(event.target.value)}
+                placeholder={canUseServerKey ? 'server key available — optional' : 'sk-…'}
+                autoComplete="off"
+                spellCheck={false}
+                aria-label="Provider API key"
+                className="w-full bg-[#090C0B] border border-[#26322C] px-2 py-1.5 text-[16px] sm:text-[11px] text-[#ECF2EE] placeholder:text-[#5D6D65] outline-none focus:border-[#10E88A]/60"
+              />
+            </label>
+            <label className="block">
+              <span className="block text-[9.5px] uppercase tracking-wider text-[#78897F] mb-1">Model</span>
+              <input
+                type="text"
+                value={formModel}
+                onChange={(event) => setFormModel(event.target.value)}
+                placeholder={DEFAULT_LIVE_MODEL[formProvider]}
+                autoComplete="off"
+                spellCheck={false}
+                aria-label="Live model id"
+                className="w-full bg-[#090C0B] border border-[#26322C] px-2 py-1.5 text-[16px] sm:text-[11px] text-[#ECF2EE] placeholder:text-[#5D6D65] outline-none focus:border-[#10E88A]/60"
+              />
+            </label>
+          </div>
+
+          {canUseServerKey && (
+            <p className="text-[10px] text-[#8A9A91]">
+              This server already holds a {formProvider === 'openai' ? 'OpenAI' : 'OpenRouter'} key — you can connect
+              with the field empty.
+            </p>
+          )}
+          {formError && <p className="text-[10px] text-[#F87171]">{formError}</p>}
+
+          <div className="flex flex-wrap items-center gap-2 pt-0.5">
+            <button
+              type="button"
+              onClick={connectLive}
+              className="inline-flex items-center gap-1.5 px-3 py-1.5 text-[10.5px] font-semibold bg-[#10E88A] text-[#06110B] hover:bg-[#34F5A1] transition-colors cursor-pointer"
+            >
+              <Zap className="w-3 h-3" />
+              {live ? 'Update connection' : 'Connect'}
+            </button>
+            {live && (
+              <button
+                type="button"
+                onClick={disconnectLive}
+                className="px-2.5 py-1.5 text-[10.5px] border border-[#3A2A2A] bg-[#171111] text-[#F0A0A0] hover:border-[#F87171]/60 transition-colors cursor-pointer"
+              >
+                Disconnect
+              </button>
+            )}
+            <span className="text-[9.5px] text-[#78897F]">
+              prompts then stream from the provider through this site&apos;s relay
+            </span>
+          </div>
+        </div>
+      )}
 
       {/* ================= SHELL VIEW ================= */}
       {!session && (
@@ -902,21 +1197,36 @@ export const OpenCodeTerminal: React.FC = () => {
               ))}
             </div>
 
-            <button
-              type="button"
-              onClick={() => {
-                setLines(BOOT_LINES);
-                setBusy(false);
-                setProxyRunning(true);
-                setHistory([]);
-                historyIndex.current = -1;
-                shellInputRef.current?.focus();
-              }}
-              className="inline-flex items-center gap-1 px-2.5 py-1 bg-[#141B18] hover:bg-[#1C2521] text-[#C5D2CB] border border-[#28342E] transition-colors cursor-pointer shrink-0"
-            >
-              <RotateCcw className="w-3 h-3 text-[#10E88A]" />
-              <span>Reset</span>
-            </button>
+            <div className="flex items-center gap-1.5 shrink-0">
+              <button
+                type="button"
+                onClick={openConnectPanel}
+                title={live ? 'Live model settings' : 'Connect a real model'}
+                className={`inline-flex items-center gap-1 px-2.5 py-1 border transition-colors cursor-pointer ${
+                  live
+                    ? 'bg-[#10E88A]/12 border-[#10E88A]/45 text-[#10E88A] hover:bg-[#10E88A]/20'
+                    : 'bg-[#141B18] border-[#28342E] text-[#C5D2CB] hover:border-[#10E88A]/50 hover:text-[#10E88A]'
+                }`}
+              >
+                <Zap className="w-3 h-3" />
+                <span>{live ? 'live' : 'connect'}</span>
+              </button>
+              <button
+                type="button"
+                onClick={() => {
+                  setLines(BOOT_LINES);
+                  setBusy(false);
+                  setProxyRunning(true);
+                  setHistory([]);
+                  historyIndex.current = -1;
+                  shellInputRef.current?.focus();
+                }}
+                className="inline-flex items-center gap-1 px-2.5 py-1 bg-[#141B18] hover:bg-[#1C2521] text-[#C5D2CB] border border-[#28342E] transition-colors cursor-pointer shrink-0"
+              >
+                <RotateCcw className="w-3 h-3 text-[#10E88A]" />
+                <span>Reset</span>
+              </button>
+            </div>
           </div>
         </>
       )}
@@ -942,8 +1252,17 @@ export const OpenCodeTerminal: React.FC = () => {
               >
                 {modeLabel}
               </span>
+              {live && (
+                <button
+                  type="button"
+                  onClick={openConnectPanel}
+                  className="px-1.5 py-0.5 border border-[#10E88A]/45 bg-[#10E88A]/12 text-[#10E88A] cursor-pointer hover:bg-[#10E88A]/20 transition-colors"
+                >
+                  LIVE
+                </button>
+              )}
               <span className="px-1.5 py-0.5 border border-[#26322C] bg-[#121815] text-[#B4C2BA] max-w-[150px] truncate">
-                {session.model}
+                {live ? live.model : session.model}
               </span>
             </div>
           </div>
@@ -958,8 +1277,10 @@ export const OpenCodeTerminal: React.FC = () => {
               {session.mode === 'mode1'
                 ? '10 free models routed through 127.0.0.1:8080 · no API key · WARP IPv6 rotation on 429'
                 : 'OpenRouter bridge on 127.0.0.1:8085 · BYOK models alongside the free pool'}
-              <div className="mt-1 text-[#5D6D65]">
-                demo session · replies are simulated in your browser
+              <div className={`mt-1 ${live ? 'text-[#10E88A]' : 'text-[#78897F]'}`}>
+                {live
+                  ? `live · ${live.provider} · replies stream from your key through this site's relay`
+                  : 'demo session · replies are simulated in your browser'}
               </div>
             </div>
 
@@ -1036,7 +1357,9 @@ export const OpenCodeTerminal: React.FC = () => {
               placeholder={
                 streamingText !== null
                   ? 'streaming…'
-                  : 'ask anything · /help for commands · esc to exit'
+                  : live
+                    ? `ask ${live.model} · /connect to change · esc to exit`
+                    : 'ask anything · /connect for live replies · esc to exit'
               }
               className="flex-1 min-w-0 bg-transparent border-0 outline-none text-[16px] sm:text-[12.5px] font-mono text-[#ECF2EE] placeholder:text-[#5D6D65] caret-[#10E88A] p-0 focus:ring-0"
             />
@@ -1055,7 +1378,15 @@ export const OpenCodeTerminal: React.FC = () => {
             <div className="flex items-center gap-3">
               <span><span className="text-[#B4C2BA]">esc</span> exit</span>
               <span><span className="text-[#B4C2BA]">/model</span> switch</span>
-              <span><span className="text-[#B4C2BA]">/proxy status</span> gateway</span>
+              <button
+                type="button"
+                onClick={openConnectPanel}
+                className={`cursor-pointer transition-colors ${
+                  live ? 'text-[#10E88A] hover:text-[#34F5A1]' : 'text-[#B4C2BA] hover:text-[#10E88A]'
+                }`}
+              >
+                {live ? 'live settings' : '/connect api'}
+              </button>
             </div>
             <button
               type="button"
